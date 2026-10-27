@@ -21,7 +21,8 @@
   },
   "bin": {
     "pomerado": "dist/typescript/src/standalone/cli.js",
-    "pomerado-mcp": "dist/typescript/src/standalone/mcp-cli.js"
+    "pomerado-mcp": "dist/typescript/src/standalone/mcp-cli.js",
+    "pomerado-replay": "dist/typescript/src/standalone/replay-cli.js"
   },
   "exports": {
     ".": {

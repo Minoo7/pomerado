@@ -1,3 +1,4 @@
+import { superviseOperation, withoutInspectorBanner, type OperationDiagnostics, type OperationSupervisor } from "./local-operation-supervisor.js";
 import { stageSources } from "./local-operation-stage.js";
 import { serialize } from "node:v8";
 import { fileURLToPath } from "node:url";
@@ -30,7 +31,7 @@ import {
   type SessionSignInAnswer,
   type SessionSignInHook,
 } from "../runtime/session-sign-in.js";
-import { createLocalProcess, type LocalProcess, type LocalProcessResult } from "./local-process.js";
+import { createLocalProcess, type LocalProcess, type LocalProcessResult, type LocalProcessLifecycle } from "./local-process.js";
 import { localError, localOutputLimit } from "./local-path.js";
 import { LocalOperationMessage, type LocalOperationResult } from "./local-operation-protocol.js";
 import type { LocalWorkspace } from "./local-workspace.js";
@@ -40,6 +41,9 @@ import { HttpFailure, type HttpTransport } from "../runtime/site-http.js";
 import type { ListHost } from "../runtime/list-page.js";
 
 export interface LocalOperationOptions {
+  readonly diagnostics?: OperationDiagnostics;
+  readonly processLifecycle?: LocalProcessLifecycle;
+  readonly inheritedDeadline?: { readonly name: string; readonly budgetMs: number; readonly remainingMs: () => number };
   readonly diagnostic?: (kind: string, data: unknown) => void;
   readonly workspace: LocalWorkspace;
   readonly entrypoint: string;
@@ -163,6 +167,8 @@ export interface LocalOperationOutput extends LocalOperationJournal {
   /** The output failed its schema and was kept (`keepDriftedOutput`). */
   readonly outputDrift?: true;
 }
+
+class LocalOperationDeadline extends Error {}
 
 const sendToChild = (process: LocalProcess, message: object) =>
   Effect.async<void, Error>((resume) => {
@@ -375,6 +381,7 @@ const receiveOperation = (
   process: LocalProcess,
   options: LocalOperationOptions,
   deadline: Deadline,
+  supervisor?: OperationSupervisor,
 ) =>
   Effect.gen(function* () {
     const completed = yield* Deferred.make<LocalOperationResult, Error>();
@@ -382,21 +389,27 @@ const receiveOperation = (
     // The run's card answers, which only its own `fillCard` names; nothing keeps them past it.
     const cardHandles = makeRunCardHandles();
     let finished = false;
+    let childDeadlineFired = false;
     let current: LocalOperationJournal = { effect: "not_sent", commits: [] };
     const listener = (raw: unknown) => {
+      if (supervisor?.accept(raw, process.child)) return;
       if (finished) return;
+      const receiptSpan = supervisor?.begin("host.result.decode");
       const decoded = Effect.runSync(decodeMessage(raw).pipe(Effect.either));
+      if (receiptSpan !== undefined) supervisor?.end(receiptSpan, decoded._tag === "Right" ? "ok" : "error");
       if (decoded._tag === "Left") {
         finished = true;
         Effect.runSync(Deferred.fail(completed, decoded.left));
         return;
       }
       const message = decoded.right;
+      if (message.kind === "error" && message.deadlineFired === "child.operation") childDeadlineFired = true;
       if (message.kind === "journal" || message.kind === "error" || message.kind === "result")
         current = operationJournal(message);
       if (message.kind === "journal") return;
       if (message.kind === "result" || message.kind === "error" || message.kind === "cancel") {
         if (message.kind !== "cancel") finished = true;
+        if (message.kind !== "cancel") supervisor?.received();
         if (message.kind === "result") options.diagnostic?.("operation.result", message);
         if (message.kind === "error") options.diagnostic?.("operation.child.error", {
           error: message.privateDetail ?? { traceCapture: "exceeds_ipc_limit" },
@@ -409,16 +422,26 @@ const receiveOperation = (
         Effect.runSync(Deferred.fail(completed, new Error("Duplicate local operation request")));
         return;
       }
+      supervisor?.request(message.id);
+      if (message.kind !== "execute") supervisor?.recorder.gap("unsupported_capability");
+      const captureOrder = message.kind === "execute" ? supervisor?.recorder.request(message.body) : undefined;
+      const hostSpan = supervisor?.begin("host.browser", message.id);
       const task = handleRequest(options, deadline, message, cardHandles).pipe(
         Effect.exit,
         Effect.flatMap((exit) => {
-          if (Exit.isSuccess(exit))
-            return sendToChild(process, { kind: "reply", id: message.id, value: exit.value });
+          if (hostSpan !== undefined) supervisor?.end(hostSpan, Exit.isSuccess(exit) ? "ok" : "error");
+          const replySpan = supervisor?.begin("reply.in_flight", message.id);
+          const delivered = (reply: object) => {
+            return (supervisor?.beforeReply() ?? Effect.void).pipe(Effect.zipRight(Effect.suspend(() => {
+              if (captureOrder !== undefined) supervisor?.recorder.reply(captureOrder, reply);
+              return sendToChild(process, { ...reply, id: message.id });
+            })),Effect.onExit((sent) => Effect.sync(() => { if (replySpan !== undefined) supervisor?.end(replySpan, Exit.isSuccess(sent) ? "ok" : "error"); })));
+          };
+          if (Exit.isSuccess(exit)) return delivered({ kind: "reply", value: exit.value });
           const error = localError(Cause.squash(exit.cause));
           const code = failureCode(error);
-          return sendToChild(process, {
+          return delivered({
             kind: "failure",
-            id: message.id,
             error: error.message,
             ...(code === undefined ? {} : { code }),
           });
@@ -428,6 +451,7 @@ const receiveOperation = (
         Effect.ensuring(
           Effect.sync(() => {
             pending.delete(message.id);
+            supervisor?.reply(message.id);
           }),
         ),
       );
@@ -470,6 +494,7 @@ const receiveOperation = (
       completed: completion.pipe(Effect.raceFirst(exited)),
       pending,
       journal: Effect.sync(() => current),
+      childDeadlineFired: () => childDeadlineFired,
     };
   });
 
@@ -519,7 +544,6 @@ const checkOutputFiles = (files: RunFiles | undefined, result: LocalOperationRes
     ),
   );
 
-/** Executes one immutable reviewed snapshot through the original operation runtime, without replay. */
 export const runLocalOperation = (
   options: LocalOperationOptions,
 ): Effect.Effect<LocalOperationOutput, Error> =>
@@ -529,10 +553,15 @@ export const runLocalOperation = (
       if (!Number.isFinite(timeoutMs) || timeoutMs <= 0)
         return yield* Effect.fail(new Error("Local operation timeout must be positive and finite"));
       const deadline = Deadline.after(timeoutMs);
-      const staged = yield* stageSources(options);
-      const process = yield* createLocalProcess({
+      let supervisor: OperationSupervisor | undefined;
+      try { if (options.diagnostics !== undefined) supervisor = superviseOperation(options.diagnostics.open(options), timeoutMs, deadline, options.inheritedDeadline); } catch {}
+      const supervised = supervisor;
+      yield* Effect.addFinalizer(() => supervised?.close() ?? Effect.void);
+      const staged = yield* supervised === undefined ? stageSources(options) : supervised.effect("stage", stageSources(options));
+      const launch = createLocalProcess({
         command: globalThis.process.execPath,
         args: [
+          ...(supervised?.recorder.selection.depth === "profile" ? ["--inspect-publish-uid=stderr"] : []),
           fileURLToPath(
             new URL(
               import.meta.url.endsWith(".ts")
@@ -545,11 +574,17 @@ export const runLocalOperation = (
         cwd: staged.directory,
         environment: options.workspace.environment,
         ipc: true,
+        ...(options.processLifecycle === undefined ? {} : { lifecycle: options.processLifecycle }),
+        ...(supervised?.recorder.selection.depth === "profile" ? { stderrLine: withoutInspectorBanner } : {}),
       });
-      const response = yield* receiveOperation(process, options, deadline);
+      const process = yield* supervised === undefined ? launch : supervised.effect("child.start", launch);
+      supervised?.processStarted(process.child.pid);
+      yield* Effect.addFinalizer((exit) => (supervised === undefined ? Effect.void : Exit.isFailure(exit) ? supervised.beforeKill(Cause.isInterruptedOnly(exit.cause) ? "interrupted" : "error") : supervised.stopInspector()).pipe(Effect.zipRight(supervised === undefined ? process.close : supervised.effect("cleanup", process.close))).pipe(Effect.orDie));
+      const response = yield* receiveOperation(process, options, deadline, supervised);
       yield* sendToChild(process, {
         kind: "start",
-        ...(options.diagnostic === undefined ? {} : { privateDiagnostic: true }),
+        ...((supervised?.recorder.selection.capture !== "none" && options.diagnostic !== undefined) ? { privateDiagnostic: true } : {}),
+        ...(supervised === undefined || supervised.recorder.selection.depth === "normal" ? {} : { diagnosticDepth: supervised.recorder.selection.depth }),
         entrypoint: staged.entrypoint,
         input: options.input,
         ...(options.retainedOutput === undefined ? {} : { retainedOutput: options.retainedOutput }),
@@ -587,7 +622,7 @@ export const runLocalOperation = (
           deadline.awaitExpiry.pipe(
             Effect.zipRight(
               Effect.fail(
-                new Error("Local operation deadline expired; execution was not replayed"),
+                new LocalOperationDeadline("Local operation deadline expired; execution was not replayed"),
               ),
             ),
           ),
@@ -606,6 +641,7 @@ export const runLocalOperation = (
                     undefined,
                     { reported: false },
                   );
+            yield* supervised?.beforeKill(error instanceof LocalOperationDeadline || response.childDeadlineFired() ? "deadline" : "error", response.childDeadlineFired() ? "child.operation" : "operation") ?? Effect.void;
             yield* process.close;
             const channels = yield* process.result.pipe(Effect.either);
             options.diagnostic?.("operation.process", channels);
@@ -623,6 +659,7 @@ export const runLocalOperation = (
       // Only a file this run collected may stand in its output; a script cannot name another.
       yield* checkOutputFiles(options.files, result).pipe(
         Effect.tapError(() => Effect.gen(function* () {
+          yield* supervised?.beforeKill("error") ?? Effect.void;
           yield* process.close;
           if (options.diagnostic !== undefined) {
             const channels = yield* process.result.pipe(Effect.either);
@@ -631,6 +668,8 @@ export const runLocalOperation = (
         })),
         Effect.tapErrorCause((cause) => Effect.sync(() => options.diagnostic?.("operation.host.error", cause))),
       );
+      yield* (supervised?.awaitSendCompletion() ?? Effect.void);
+      yield* (supervised?.stopInspector() ?? Effect.void);
       yield* process.close.pipe(
         Effect.tapErrorCause((cause) => Effect.sync(() => options.diagnostic?.("operation.host.error", cause))),
       );

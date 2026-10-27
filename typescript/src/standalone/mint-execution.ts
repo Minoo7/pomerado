@@ -603,7 +603,7 @@ const authoredExecution = (
           !admission.ok
             ? Effect.fail(refusedCursor(admission))
             : runLocalOperation({
-                ...(state.session.trace === undefined ? {} : { diagnostic: (kind: string, data: unknown) => state.session.trace?.event(kind, { executionId: id, entrypoint: execution.entrypoint, detail: data }, id) }),
+                ...(state.session.trace === undefined ? {} : { diagnostics: state.session.trace.operations, diagnostic: (kind: string, data: unknown) => state.session.trace?.event(kind, { executionId: id, entrypoint: execution.entrypoint, detail: data }, id) }),
                 workspace,
                 entrypoint: execution.entrypoint,
                 // Only a live step receives a value; offline steps run the handle text as written.
@@ -620,6 +620,7 @@ const authoredExecution = (
                   ? {}
                   : { siteDomain: siteDomain(context.siteOrigin) ?? "" }),
                 timeoutMs: execution.timeoutSeconds * 1000,
+                ...(state.session.trace === undefined ? {} : { inheritedDeadline: { name: "mint", budgetMs: state.session.options.timeoutMs ?? 1_200_000, remainingMs: () => state.deadline.remainingMs() } }),
                 mode: "run",
                 target: live ? "browser" : "pureFiles",
                 dispatchAtFirstCall: true,

@@ -88,6 +88,7 @@ export const runOperation = (
     const dialogs = watchingUnanswered(ask);
     const result = yield* runLocalOperation({
       workspace,
+      ...(session.trace === undefined ? {} : { diagnostic: session.trace.event, diagnostics: session.trace.operations }),
       entrypoint: artifact.entrypoint,
       sources,
       input: request.input ?? {},

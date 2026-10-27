@@ -15,12 +15,15 @@ export interface LocalProcess {
   readonly close: Effect.Effect<void, Error>;
 }
 
-const signalGroup = (child: ChildProcess) =>
+export type LocalProcessLifecycle = { readonly kind: "inherited"; readonly stop: (child: ChildProcess) => void };
+
+const signalGroup = (child: ChildProcess, lifecycle?: LocalProcessLifecycle) =>
   Effect.try({
     try: () => {
       if (child.pid === undefined) return;
       try {
-        process.kill(-child.pid, "SIGKILL");
+        if (lifecycle === undefined) process.kill(-child.pid, "SIGKILL");
+        else lifecycle.stop(child);
       } catch (cause) {
         if (!(cause instanceof Error && "code" in cause && cause.code === "ESRCH")) throw cause;
       }
@@ -35,7 +38,9 @@ export const createLocalProcess = (options: {
   readonly cwd: string;
   readonly environment: Readonly<Record<string, string>>;
   readonly ipc?: boolean;
+  readonly lifecycle?: LocalProcessLifecycle;
   readonly outputLimit?: number;
+  readonly stderrLine?: (line: string) => string;
 }): Effect.Effect<LocalProcess, Error, Scope.Scope> =>
   Effect.gen(function* () {
     if (process.platform === "win32")
@@ -46,7 +51,7 @@ export const createLocalProcess = (options: {
         spawn(options.command, [...options.args], {
           cwd: options.cwd,
           env: { ...options.environment },
-          detached: true,
+          detached: options.lifecycle === undefined,
           serialization: "advanced",
           stdio: options.ipc ? ["ignore", "pipe", "pipe", "ipc"] : ["ignore", "pipe", "pipe"],
         }),
@@ -56,11 +61,19 @@ export const createLocalProcess = (options: {
     const lengths = { stdout: 0, stderr: 0 };
     let stdout = "";
     let stderr = "";
+    let stderrPending = "";
+    const appendStderr = (text: string, final = false) => {
+      if (options.stderrLine === undefined) { stderr += text; return; }
+      stderrPending += text;
+      let end: number;
+      while ((end = stderrPending.indexOf("\n")) >= 0) { stderr += options.stderrLine(stderrPending.slice(0, end + 1)); stderrPending = stderrPending.slice(end + 1); }
+      if (final) { stderr += options.stderrLine(stderrPending); stderrPending = ""; }
+    };
     let failure: Error | undefined;
     let closeFiber: Fiber.RuntimeFiber<void, Error> | undefined;
     const close = Effect.suspend(() => {
       closeFiber ??= Effect.runFork(
-        signalGroup(child).pipe(
+        signalGroup(child, options.lifecycle).pipe(
           Effect.zipRight(Deferred.await(ended).pipe(Effect.either, Effect.asVoid)),
           Effect.timeoutFail({
             duration: 5_000,
@@ -85,7 +98,7 @@ export const createLocalProcess = (options: {
       }
       const text = decoders[channel].write(bytes);
       if (channel === "stdout") stdout += text;
-      else stderr += text;
+      else appendStderr(text);
     };
     child.stdout?.on("data", (bytes: Buffer) => capture("stdout", bytes));
     child.stderr?.on("data", (bytes: Buffer) => capture("stderr", bytes));
@@ -94,7 +107,7 @@ export const createLocalProcess = (options: {
     });
     child.once("close", (exitCode, signal) => {
       stdout += decoders.stdout.end();
-      stderr += decoders.stderr.end();
+      appendStderr(decoders.stderr.end(), true);
       Effect.runSync(
         failure === undefined
           ? Deferred.succeed(ended, { exitCode, signal, stdout, stderr })

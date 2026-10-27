@@ -181,7 +181,13 @@ export const makeEffectJournalWith = (options: {
 
 export const makeEffectJournal: Effect.Effect<EffectJournal> = makeEffectJournalWith({});
 
+export interface PhaseProbe {
+  readonly effect: <A, E, R>(phase: "input.decode" | "operation.run" | "output.validate", work: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>;
+}
+export const runtimePhase = <A, E, R>(context: { readonly phases?: PhaseProbe }, phase: Parameters<PhaseProbe["effect"]>[0], work: () => Effect.Effect<A, E, R>) => context.phases === undefined ? Effect.suspend(work) : context.phases.effect(phase, Effect.suspend(work));
+
 export interface ExecutionServices {
+  readonly phases?: PhaseProbe;
   readonly deadline: Deadline;
   readonly events: EventSink;
   readonly capture: CaptureLifecycle;

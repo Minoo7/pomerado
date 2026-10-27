@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Standalone diagnostics have selectable `normal`, `debug`, `trace`, and `profile` depths. Capture permission is separate and callers cannot exceed the operator's setting. Phase and deadline reports identify unfinished work. Bounded CPU profiles sample blocked child processes. `pomerado-replay` reconstructs supported operations from private bundles inside a Linux seccomp and Landlock sandbox. See [Standalone diagnostics and offline replay](docs/standalone-diagnostics.md) for configuration, limits, and retention.
+- Local operation children wait for IPC send callbacks before disconnecting. Large results could previously be lost after the operation finished, leaving the parent waiting until its deadline. Synchronous journal methods enqueue sends that drain before the final receipt.
 - The standalone mint MCP host can retain a private per-job JSONL trace through `POMERADO_TRACE_DIR` or `makePomeradoMcp({ traceDirectory })`. Traces capture model and tool I/O, raw execution failures and output, authored sources, and lifecycle events through cleanup. Files use mode `0600` in an owned `0700` directory. Registered secrets and transport credentials are excluded. Tracing is disabled by default and preserves existing execution limits and finite MCP outcomes.
 
 ### Breaking changes

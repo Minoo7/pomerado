@@ -1,6 +1,6 @@
 import { Effect, Option } from "effect";
 import type { Scope } from "effect";
-import { ExecutionContext, finishCaptureAsEvidence } from "./context.js";
+import { ExecutionContext, runtimePhase, finishCaptureAsEvidence } from "./context.js";
 import type { EffectJournal } from "./context.js";
 import { DeadlineExceeded } from "./errors.js";
 import type { CaptureUnavailable, EventUnavailable, InvalidInput, InvalidOutput } from "./errors.js";
@@ -100,7 +100,7 @@ export const executeKernelOperation = <
     const execution = yield* ExecutionContext;
     // Declared first, so every exit reports which commit steps were never reached.
     yield* execution.journal.declareCommits(declaredCommits(operation.write));
-    const decoded = yield* decodeKernelOperationInput(operation, rawInput);
+    const decoded = yield* runtimePhase(execution, "input.decode", () => decodeKernelOperationInput(operation, rawInput));
     // A host that signs list cursors puts the checked position beside the input, never in it.
     const input = browser.list === undefined ? decoded : withListHost(decoded, browser.list);
     if (execution.deadline.remainingMs() <= 0)
@@ -119,8 +119,8 @@ export const executeKernelOperation = <
         deadline: execution.deadline,
         ...(Option.isSome(scriptInput) ? { scriptInput: scriptInput.value } : {}),
       });
-      const output = yield* first === undefined ? script : first(script, input);
-      const validated = yield* validateKernelOperationOutput(operation, output);
+      const output = yield* runtimePhase<Output, ScriptFailure | FirstError, FirstServices>(execution, "operation.run", () => first === undefined ? script : first(script, input));
+      const validated = yield* runtimePhase(execution, "output.validate", () => validateKernelOperationOutput(operation, output));
       yield* execution.events.emit("operation.output_validated", { operation: operation.name });
       return validated;
     }).pipe(

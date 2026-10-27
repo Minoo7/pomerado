@@ -3,7 +3,7 @@ import { registerHooks, stripTypeScriptTypes } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { serialize } from "node:v8";
 import { randomUUID } from "node:crypto";
-import { Cause, Effect, Exit, Schema } from "effect";
+import { Cause, Effect, Exit, Fiber, Schema } from "effect";
 import type { Deadline as RunDeadline } from "../runtime/deadline.js";
 import type { Operation } from "../runtime/operation.js";
 import type { ScriptInput as ScriptInputTag } from "../runtime/script-input.js";
@@ -44,7 +44,7 @@ const { makeSiteHttp } = await import("../runtime/site-http-host.js");
 const { ExecutionContext, makeEffectJournal } = await import("../runtime/context.js");
 const { Deadline } = await import("../runtime/deadline.js");
 const { makeKernelCompatibility } = await import("../runtime/kernel-compatibility.js");
-const { InvalidInput, InvalidOutput } = await import("../runtime/errors.js");
+const { DeadlineExceeded, InvalidInput, InvalidOutput } = await import("../runtime/errors.js");
 const { boundedInputDetail, boundedRefusalDetail } = await import(
   "../runtime/operation-failure.js"
 );
@@ -90,9 +90,21 @@ const authoredFrame = (error: unknown): string | undefined => {
   }
   return undefined;
 };
+let diagnosticEnabled = false;
+let diagnosticSequence = 0;
+const diagnosticSend = (message: object) => send(message).pipe(Effect.catchAll(() => Effect.void));
+const childPhase = <A, E, R>(phase: string, work: Effect.Effect<A, E, R>, rpc?: string): Effect.Effect<A, E, R> =>
+  Effect.suspend(() => {
+    if (!diagnosticEnabled) return work;
+    const id = `child:${++diagnosticSequence}`;
+    return diagnosticSend({ kind: "diagnostic", event: "start", id, parent: "operation", phase, ...(rpc === undefined ? {} : { rpc }) }).pipe(
+      Effect.zipRight(work),
+      Effect.onExit((exit) => diagnosticSend({ kind: "diagnostic", event: "end", id, outcome: Exit.isSuccess(exit) ? "ok" : Cause.isInterruptedOnly(exit.cause) ? "interrupted" : "error" })),
+    );
+  });
 const replies = new Map<string, (result: Effect.Effect<unknown, Error>) => void>();
-const send = (message: unknown) =>
-  Effect.try({
+const send = (message: unknown, terminal = false) => {
+  const validated = Effect.try({
     try: () => {
       if (process.send === undefined || !process.connected)
         throw new Error("Local operation IPC unavailable");
@@ -100,10 +112,28 @@ const send = (message: unknown) =>
         throw new Error("Local operation IPC exceeds output limit");
       if (typeof message !== "object" || message === null)
         throw new Error("Local IPC message must be an object");
-      process.send(message);
+      return message;
     },
     catch: localError,
   });
+  return (terminal ? childPhase("result.serialize", validated) : validated).pipe(
+    Effect.flatMap((message) => {
+      const sent = Effect.async<void, Error>((resume) => {
+        try {
+          if (process.send === undefined || !process.connected)
+            throw new Error("Local operation IPC unavailable");
+          process.send(message, (error) =>
+            resume(error === null ? Effect.void : Effect.fail(localError(error))),
+          );
+        } catch (cause) {
+          resume(Effect.fail(localError(cause)));
+        }
+      });
+      return terminal ? childPhase("result.send", sent) : sent;
+    }),
+  );
+};
+const terminalSend = (message: object) => send(message, true);
 const privateErrorMessage = (message: object, error: unknown, enabled: boolean) => {
   if (!enabled) return message;
   let privateDetail: unknown;
@@ -121,7 +151,7 @@ const call = (payload: object) =>
   Effect.async<unknown, Error>((resume) => {
     const id = randomUUID();
     replies.set(id, resume);
-    Effect.runCallback(send({ id, ...payload }), {
+    Effect.runCallback(childPhase("browser.request", send({ id, ...payload }), id), {
       onExit: (exit) => {
         if (Exit.isFailure(exit)) {
           replies.delete(id);
@@ -136,6 +166,7 @@ const call = (payload: object) =>
 const start = await Effect.runPromise(
   Effect.async<typeof LocalOperationStart.Type, Error>((resume) => {
     process.on("message", (message: unknown) => {
+      if (typeof message === "object" && message !== null && Reflect.get(message, "kind") === "diagnostic.ready") return;
       const initial = Schema.decodeUnknownEither(LocalOperationStart)(message);
       if (initial._tag === "Right") {
         resume(Effect.succeed(initial.right));
@@ -161,6 +192,29 @@ const start = await Effect.runPromise(
     });
   }),
 );
+diagnosticEnabled = start.diagnosticDepth !== undefined;
+let heartbeatSequence = 0;
+let heartbeatPending = false;
+const heartbeatTimer = diagnosticEnabled ? setInterval(() => {
+  if (heartbeatPending) return;
+  heartbeatPending = true;
+  Effect.runCallback(diagnosticSend({ kind: "diagnostic", event: "heartbeat", sequence: ++heartbeatSequence }), { onExit: () => { heartbeatPending = false; } });
+}, 250) : undefined;
+heartbeatTimer?.unref();
+if (start.diagnosticDepth === "profile") {
+  await new Promise<void>(async (resolve) => {
+    const ready = (message: unknown) => { if (typeof message === "object" && message !== null && Reflect.get(message, "kind") === "diagnostic.ready") finish(); };
+    const finish = () => { clearTimeout(timer); process.off("message", ready); resolve(); };
+    const timer = setTimeout(finish, 1_500);
+    process.on("message", ready);
+    try {
+      const inspector = await import("node:inspector");
+      inspector.open(0, "127.0.0.1", false);
+      await Effect.runPromise(diagnosticSend({ kind: "inspector", url: inspector.url() ?? null }));
+    } catch { await Effect.runPromise(diagnosticSend({ kind: "inspector", url: null })); finish(); }
+  });
+}
+const phases = { effect: childPhase };
 const baseJournal = await Effect.runPromise(makeEffectJournal);
 const journalState = Effect.gen(function* () {
   const confirmation = yield* baseJournal.confirmation;
@@ -170,9 +224,20 @@ const journalState = Effect.gen(function* () {
     ...(confirmation === undefined ? {} : { confirmation }),
   };
 });
+const pendingJournalSends: Effect.Effect<void, Error>[] = [];
+const enqueueJournalSend = (metadata: object) => {
+  const pending = Effect.runFork(Effect.exit(send({ kind: "journal", ...metadata })));
+  pendingJournalSends.push(Fiber.join(pending).pipe(Effect.flatten));
+};
 const publishJournal = journalState.pipe(
-  Effect.flatMap((metadata) => send({ kind: "journal", ...metadata })),
-  Effect.orDie,
+  Effect.flatMap((metadata) =>
+    Effect.sync(() => {
+      enqueueJournalSend(metadata);
+    }),
+  ),
+);
+const drainJournalSends = Effect.suspend(() =>
+  Effect.forEach(pendingJournalSends.splice(0), (sent) => sent, { discard: true }),
 );
 const revertCommit = baseJournal.notCommitted;
 const journal: typeof baseJournal = {
@@ -231,7 +296,7 @@ const executeLocally = (operation: Parameters<typeof executeKernelOperation>[0])
             body: { code, timeout_sec: timeoutSec ?? 60 },
           }),
         ),
-        Effect.flatMap((value) => Schema.decodeUnknown(BrowserExecuteResponse)(value)),
+        Effect.flatMap((value) => childPhase("reply.decode", Effect.suspend(() => Schema.decodeUnknown(BrowserExecuteResponse)(value)))),
         Effect.mapError(localError),
       ),
     );
@@ -322,6 +387,7 @@ const executeLocally = (operation: Parameters<typeof executeKernelOperation>[0])
     }).pipe(
       Effect.provideService(ExecutionContext, {
         deadline,
+        phases,
         journal: atFirstCall ? { ...journal, enteringDispatch: Effect.void } : journal,
         events: { emit: () => Effect.void },
         capture: { start: Effect.void, finish: Effect.void },
@@ -380,6 +446,7 @@ const executeHttpVersion = (operation: HttpVersion) =>
     const deadline = Deadline.after(start.timeoutMs);
     const context = {
       deadline,
+      phases,
       journal,
       events: { emit: () => Effect.void },
       capture: { start: Effect.void, finish: Effect.void },
@@ -429,9 +496,9 @@ const extractCurrentContract = (
 ) =>
   Effect.gen(function* () {
     if (start.validateInput === true || start.retainedOutput !== undefined)
-      yield* decodeKernelOperationInput(operation, start.input);
+      yield* childPhase("input.decode", Effect.suspend(() => decodeKernelOperationInput(operation, start.input)));
     if (start.retainedOutput !== undefined) {
-      yield* Schema.decodeUnknown(operation.output)(start.retainedOutput.value).pipe(
+      yield* childPhase("output.validate", Effect.suspend(() => Schema.decodeUnknown(operation.output)(start.retainedOutput?.value))).pipe(
         Effect.mapError(
           (cause) =>
             new InvalidOutput({
@@ -442,7 +509,8 @@ const extractCurrentContract = (
         ),
       );
     }
-    yield* send({
+    yield* drainJournalSends;
+    yield* terminalSend({
       kind: "result",
       ...schemas,
       effect: "not_started",
@@ -472,10 +540,10 @@ const driftedOutput = (error: unknown): { readonly output: unknown } | undefined
 
 await Effect.runPromise(
   Effect.gen(function* () {
-    const imported: unknown = yield* Effect.tryPromise({
+    const imported: unknown = yield* childPhase("module.import", Effect.tryPromise({
       try: () => import(pathToFileURL(start.entrypoint).href),
       catch: localError,
-    });
+    }));
     const operation: unknown =
       typeof imported === "object" && imported !== null
         ? Reflect.get(imported, "default")
@@ -494,8 +562,8 @@ await Effect.runPromise(
         ),
       );
     const schemas = {
-      inputSchema: contractJsonSchema(operation.input),
-      outputSchema: contractJsonSchema(operation.output),
+      inputSchema: yield* childPhase("schema.input.export", Effect.sync(() => contractJsonSchema(operation.input))),
+      outputSchema: yield* childPhase("schema.output.export", Effect.sync(() => contractJsonSchema(operation.output))),
     };
     if (start.mode === "contract") return yield* extractCurrentContract(operation, schemas);
     const { output, outputDrift } = yield* (
@@ -510,7 +578,8 @@ await Effect.runPromise(
       }),
     );
     const confirmation = yield* journal.confirmation;
-    yield* send({
+    yield* drainJournalSends;
+    yield* terminalSend({
       kind: "result",
       output,
       ...(outputDrift === undefined ? {} : { outputDrift }),
@@ -528,6 +597,7 @@ await Effect.runPromise(
           const frame = authoredFrame(error);
           const message = {
             kind: "error",
+            ...(diagnosticEnabled && error instanceof DeadlineExceeded ? { deadlineFired: "child.operation" } : {}),
             error: error.message || error.name,
             ...metadata,
             ...("_tag" in error && typeof error._tag === "string" ? { tag: error._tag } : {}),
@@ -554,10 +624,13 @@ await Effect.runPromise(
                 ? { code: error._tag }
                 : {}),
           };
-          return send(privateErrorMessage(message, error, start.privateDiagnostic === true));
+          return drainJournalSends.pipe(
+            Effect.zipRight(terminalSend(privateErrorMessage(message, error, start.privateDiagnostic === true))),
+          );
         }),
       ),
     ),
   ),
 );
+clearInterval(heartbeatTimer);
 process.disconnect?.();

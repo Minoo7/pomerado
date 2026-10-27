@@ -1,4 +1,5 @@
-import { cp, mkdir, writeFile } from "node:fs/promises";
+import { cp, mkdir, writeFile, readFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { Effect } from "effect";
 
 const copy = (from: string, to: string) =>
@@ -26,6 +27,8 @@ Effect.runPromise(
       "typescript/src/guardian/upstream-policy.md",
       "dist/typescript/src/guardian/upstream-policy.md",
     );
+    yield* copy("typescript/src/standalone/offline-sandbox.c", "dist/typescript/src/standalone/offline-sandbox.c");
+    yield* Effect.tryPromise(async () => writeFile("dist/dependency-lock.sha256", createHash("sha256").update(await readFile("pnpm-lock.yaml")).digest("hex") + "\n"));
     yield* writeRuntimeSources;
   }),
 ).catch((error: unknown) => {

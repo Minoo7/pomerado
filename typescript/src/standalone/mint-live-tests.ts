@@ -69,7 +69,8 @@ export const localLiveTests = (state: MintState): LiveTestHost => {
     schemas: (entrypoint) =>
       Effect.gen(function* () {
         const result = yield* runLocalOperation({
-          ...(state.session.trace === undefined ? {} : { diagnostic: state.session.trace.event }),
+          ...(state.session.trace === undefined ? {} : { diagnostic: state.session.trace.event, diagnostics: state.session.trace.operations }),
+          ...(state.session.trace === undefined ? {} : { inheritedDeadline: { name: "mint", budgetMs: state.session.options.timeoutMs ?? 1_200_000, remainingMs: () => state.deadline.remainingMs() } }),
           workspace,
           entrypoint,
           sources: yield* sourcesNow,
@@ -125,7 +126,8 @@ export const localLiveTests = (state: MintState): LiveTestHost => {
             if (Either.isLeft(reset)) return { status: "inconclusive", reason: "host" } as const;
             const executed = yield* Effect.either(
               runLocalOperation({
-          ...(state.session.trace === undefined ? {} : { diagnostic: state.session.trace.event }),
+                ...(state.session.trace === undefined ? {} : { diagnostic: state.session.trace.event, diagnostics: state.session.trace.operations }),
+                ...(state.session.trace === undefined ? {} : { inheritedDeadline: { name: "mint", budgetMs: state.session.options.timeoutMs ?? 1_200_000, remainingMs: () => state.deadline.remainingMs() } }),
                 workspace,
                 entrypoint: batch.entrypoint,
                 sources,

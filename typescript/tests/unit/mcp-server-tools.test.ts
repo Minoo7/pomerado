@@ -225,3 +225,16 @@ it("serves a write tool from a folder it can't write, and refuses a keyed call t
     await rm(folder, { recursive: true, force: true });
   }
 });
+
+it("keeps ambient trace configuration out of integration discovery until explicitly enabled", async () => {
+  const previous = process.env["POMERADO_TRACE_DIR"]; const directory = await mkdtemp(join(tmpdir(), "pomerado-integration-diagnostics-"));
+  process.env["POMERADO_TRACE_DIR"] = join(directory, "ambient");
+  try {
+    const tools = await listedTools(makeIntegrationMcp({ artifact, deployment: deployment("read") }));
+    const tool = tools.find((entry) => entry.name === "read_fixture");
+    expect(tool?.inputSchema.properties).not.toHaveProperty("diagnostics");
+    expect(await readdir(directory)).toEqual([]);
+    const enabled = await listedTools(makeIntegrationMcp({ artifact, deployment: deployment("read"), traceDirectory: join(directory, "explicit") }));
+    expect(enabled.find((entry) => entry.name === "read_fixture")?.inputSchema.properties).toHaveProperty("diagnostics");
+  } finally { if (previous === undefined) delete process.env["POMERADO_TRACE_DIR"]; else process.env["POMERADO_TRACE_DIR"] = previous; await rm(directory, { recursive: true, force: true }); }
+});

@@ -61,6 +61,7 @@ export const InputNotApplied = Schema.Struct({
 const Id = Schema.String.pipe(Schema.minLength(1), Schema.maxLength(200));
 export const LocalOperationStart = Schema.Struct({
   kind: Schema.Literal("start"),
+  diagnosticDepth: Schema.optionalWith(Schema.Literal("debug", "trace", "profile"), { exact: true }),
   privateDiagnostic: Schema.optionalWith(Schema.Literal(true), { exact: true }),
   entrypoint: Schema.String,
   input: Schema.Unknown,
@@ -175,6 +176,7 @@ export const LocalOperationMessage = Schema.Union(
   }),
   Schema.Struct({
     kind: Schema.Literal("error"),
+    deadlineFired: Schema.optionalWith(Schema.Literal("child.operation"), { exact: true }),
     privateDetail: Schema.optionalWith(Schema.Unknown, { exact: true }),
     error: Schema.String,
     code: Schema.optionalWith(Schema.String, { exact: true }),

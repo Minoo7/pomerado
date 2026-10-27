@@ -1,5 +1,6 @@
 import { lstat, mkdir } from "node:fs/promises";
-import { join } from "node:path";
+import { lstatSync } from "node:fs";
+import { join, parse, resolve } from "node:path";
 import { Effect } from "effect";
 
 export const localSourceFileLimit = 8 * 1024 * 1024;
@@ -48,3 +49,18 @@ export const localFilePath = (root: string, path: string, createParents = false)
     }
     return current;
   });
+
+export const assertNoSymlinkComponents = (path: string, allowMissing = false) => {
+  const absolute = resolve(path);
+  let current = parse(absolute).root;
+  for (const part of absolute.slice(current.length).split("/").filter(Boolean)) {
+    current = join(current, part);
+    try {
+      if (lstatSync(current).isSymbolicLink()) throw new Error("Private path contains a symlink.");
+    } catch (error) {
+      if (allowMissing && localMissing(error)) return absolute;
+      throw error;
+    }
+  }
+  return absolute;
+};

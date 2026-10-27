@@ -17,6 +17,7 @@ import { nestedInput, readHints, standard, writeHints } from "../mcp/schema.js";
 import { canonicalSchema } from "../registry/schema-references.js";
 import { InputAnswers } from "../runtime/input-request.js";
 import { fileFormat } from "../runtime/files.js";
+import { DiagnosticSelection, resolveDiagnosticSelection, selectJobDiagnostics } from "../execution/local-operation-supervisor.js";
 import { validateTraceDirectory, withJobTrace, tracedEffect, type JobTrace } from "./job-trace.js";
 import { createPomerado } from "./pomerado.js";
 import { type LocalMintOutcome, type MintArtifact, type PomeradoOptions, type PomeradoRequest } from "./contracts.js";
@@ -30,12 +31,13 @@ import {
 } from "./mcp-jobs.js";
 
 interface ServerOptions {
+  readonly traceDirectory?: string;
+  readonly diagnostics?: DiagnosticSelection;
   readonly pomerado?: Omit<PomeradoOptions, "ask">;
   readonly maxJobs?: number;
   readonly waitMs?: number;
 }
 export interface PomeradoMcpOptions extends ServerOptions {
-  readonly traceDirectory?: string;
   readonly prepare: (
     request: PomeradoRequest,
     name: string,
@@ -54,6 +56,23 @@ export interface IntegrationMcpOptions extends ServerOptions {
    */
   readonly directory?: string;
 }
+const diagnosticSettings = (options: ServerOptions) => Effect.try({
+  try: () => {
+    const directory = options.traceDirectory ?? process.env["POMERADO_TRACE_DIR"];
+    if (directory === undefined) {
+      if (options.diagnostics !== undefined || process.env["POMERADO_TRACE_DEPTH"] !== undefined || process.env["POMERADO_TRACE_CAPTURE"] !== undefined) throw new Error("Diagnostics require an operator trace directory.");
+      return undefined;
+    }
+    validateTraceDirectory(directory);
+    const defaults = resolveDiagnosticSelection({
+      ...(process.env["POMERADO_TRACE_DEPTH"] === undefined ? {} : { depth: process.env["POMERADO_TRACE_DEPTH"] }),
+      ...(process.env["POMERADO_TRACE_CAPTURE"] === undefined ? {} : { capture: process.env["POMERADO_TRACE_CAPTURE"] }),
+    });
+    return { directory, selection: resolveDiagnosticSelection(options.diagnostics ?? {}, defaults) };
+  },
+  catch: (cause) => new Error("Invalid private trace directory or diagnostic selection.", { cause }),
+});
+const DiagnosticEnvelope = Schema.Struct({ depth: Schema.optionalWith(DiagnosticSelection.fields.depth, { exact: true }), capture: Schema.optionalWith(DiagnosticSelection.fields.capture, { exact: true }) });
 const JobId = Schema.Struct({ job_id: Schema.UUID });
 const GetJob = Schema.Struct({
   job_id: Schema.UUID,
@@ -223,15 +242,15 @@ const makeServer = (
 /** Discovery registers tools without creating Chromium or invoking a model. */
 export const makePomeradoMcp = (options: PomeradoMcpOptions) =>
   Effect.gen(function* () {
-    const traceDirectory = options.traceDirectory ?? process.env["POMERADO_TRACE_DIR"];
-    if (traceDirectory !== undefined) yield* Effect.try({ try: () => validateTraceDirectory(traceDirectory), catch: (cause) => new Error("Invalid private trace directory.", { cause }) });
+    const diagnostics = yield* diagnosticSettings(options);
+    const mintSchema = diagnostics === undefined ? MintRequest : Schema.Struct({ ...MintRequest.fields, diagnostics: Schema.optionalWith(DiagnosticEnvelope, { exact: true }) });
     const { server, jobs } = yield* makeServer("pomerado", options, "mint");
     server.registerTool(
       "mint",
       {
         description:
           "Mint a local, directly hostable MCP integration from a website and task. Choose read or write explicitly; ask the user before choosing write. name is a lowercase directory name using underscores within the configured output root. Starts once and returns a job ID; use get_job and provide_input to continue it.",
-        inputSchema: standard(MintRequest),
+        inputSchema: standard(mintSchema),
         annotations: writeHints,
       },
       (input, context) =>
@@ -239,7 +258,8 @@ export const makePomeradoMcp = (options: PomeradoMcpOptions) =>
           jobs
             .start((ask, jobId) => {
               const work = (trace?: JobTrace) => Effect.gen(function* () {
-                const { name, ...request } = input;
+                const { name, ...envelope } = input;
+                const { diagnostics: _selection, ...request } = { diagnostics: undefined, ...envelope };
                 trace?.event("job.request", { name, ...request });
                 const publish = yield* tracedEffect(trace, "prepare", options.prepare(request, name));
                 const pomerado = yield* createPomerado({ ...options.pomerado, ask }, trace);
@@ -249,7 +269,7 @@ export const makePomeradoMcp = (options: PomeradoMcpOptions) =>
                 const integration = yield* tracedEffect(trace, "publication", publish(result.artifact));
                 return { build: result.build, integration };
               });
-              return traceDirectory === undefined ? work() : withJobTrace(traceDirectory, jobId, work);
+              return diagnostics === undefined ? work() : withJobTrace(diagnostics.directory, jobId, work, selectJobDiagnostics("diagnostics" in input ? input.diagnostics ?? {} : {}, diagnostics.selection));
             },
             )
             .pipe(Effect.map(jobResult)),
@@ -289,6 +309,7 @@ const withoutFileFormat = <Schema>(schema: Schema): Schema => {
 interface BusinessCall {
   readonly input: unknown;
   readonly idempotency_key?: string;
+  readonly diagnostics?: Partial<DiagnosticSelection>;
 }
 /**
  * The integration tool's call schema: the operation's input nested under `input`, titled and
@@ -300,6 +321,7 @@ const businessInput = (
   inputSchema: unknown,
   outputSchema: unknown,
   write: boolean,
+  diagnostics: boolean,
 ) =>
   Effect.gen(function* () {
     const input = yield* Schema.decodeUnknown(SchemaObject)(inputSchema).pipe(
@@ -322,6 +344,7 @@ const businessInput = (
           properties: {
             input: nestedInput(name, canonical),
             ...(write ? { idempotency_key: idempotencyKey } : {}),
+            ...(diagnostics ? { diagnostics: { type: "object", properties: { depth: { enum: ["normal", "debug", "trace", "profile"] }, capture: { enum: ["none", "payload", "replay"] } }, additionalProperties: false } } : {}),
           },
           required: ["input"],
           additionalProperties: false,
@@ -355,6 +378,7 @@ const businessInput = (
   });
 export const makeIntegrationMcp = (options: IntegrationMcpOptions) =>
   Effect.gen(function* () {
+    const diagnostics = options.traceDirectory === undefined && options.diagnostics === undefined ? undefined : yield* diagnosticSettings(options);
     const artifact = yield* validateArtifact(options.artifact);
     const deployment = yield* Schema.decodeUnknown(Deployment)(options.deployment).pipe(
       Effect.mapError((cause) => new Error("Invalid integration deployment.", { cause })),
@@ -365,6 +389,7 @@ export const makeIntegrationMcp = (options: IntegrationMcpOptions) =>
       artifact.inputSchema,
       artifact.outputSchema,
       write,
+      diagnostics !== undefined,
     );
     // Only a write takes an idempotency_key, so only a write keeps its jobs in the folder.
     const store =
@@ -388,14 +413,13 @@ export const makeIntegrationMcp = (options: IntegrationMcpOptions) =>
           Effect.gen(function* () {
             const key = input.idempotency_key;
             const started = yield* jobs.start(
-              (ask) =>
-                Effect.gen(function* () {
-                  const pomerado = yield* createPomerado({ ...options.pomerado, ask });
-                  return yield* pomerado.run(artifact, {
-                    ...deployment.request,
-                    input: input.input,
-                  });
-                }),
+              (ask, jobId) => {
+                const work = (trace?: JobTrace) => Effect.gen(function* () {
+                  const pomerado = yield* createPomerado({ ...options.pomerado, ask }, trace);
+                  return yield* pomerado.run(artifact, { ...deployment.request, input: input.input });
+                });
+                return diagnostics === undefined ? work() : withJobTrace(diagnostics.directory, jobId, work, selectJobDiagnostics(input.diagnostics ?? {}, diagnostics.selection));
+              },
               key === undefined
                 ? undefined
                 : {

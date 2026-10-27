@@ -1,6 +1,6 @@
 import { Effect, JSONSchema, Option, Schema } from "effect";
 import type { Scope } from "effect";
-import { ExecutionContext, finishCaptureAsEvidence } from "./context.js";
+import { ExecutionContext, runtimePhase, finishCaptureAsEvidence } from "./context.js";
 import type { EffectJournal } from "./context.js";
 import {
   DeadlineExceeded,
@@ -208,7 +208,7 @@ export const executeOperation = <Input, EncodedInput, Output, EncodedOutput, Err
       Array.isArray(declared) ? declared.filter((name) => typeof name === "string") : [],
     );
     // Every rejected path, not only the first, so one correction can fix them all.
-    const input = yield* Schema.decodeUnknown(operation.input, { errors: "all" })(rawInput).pipe(
+    const input = yield* runtimePhase(context, "input.decode", () => Schema.decodeUnknown(operation.input, { errors: "all" })(rawInput).pipe(
       Effect.mapError(
         (error) =>
           new InvalidInput({
@@ -216,7 +216,7 @@ export const executeOperation = <Input, EncodedInput, Output, EncodedOutput, Err
             issues: inputIssues(operation.input, error),
           }),
       ),
-    );
+    ));
     const remainingMs = context.deadline.remainingMs();
     if (remainingMs <= 0) {
       return yield* new DeadlineExceeded({ phase: "execution", dispatch: "not_sent" });
@@ -238,7 +238,7 @@ export const executeOperation = <Input, EncodedInput, Output, EncodedOutput, Err
             }
           : context.journal;
       const runInput = options.list === undefined ? input : withListHost(input, options.list);
-      const output = yield* Effect.suspend(() => operation.run(runInput)).pipe(
+      const output = yield* runtimePhase(context, "operation.run", () => Effect.suspend(() => operation.run(runInput)).pipe(
         // A runtime helper the run calls outside an Effect, such as `startList` refusing its
         // cursor, throws the caller's input refusal: the run fails with it, as a Kernel script's
         // does, rather than dying. Only a cause that is that one defect alone becomes the failure,
@@ -249,12 +249,12 @@ export const executeOperation = <Input, EncodedInput, Output, EncodedOutput, Err
             : Option.none(),
         ),
         Effect.provideService(ExecutionContext, { ...context, journal }),
-      );
-      const validated = yield* Schema.validate(operation.output)(output).pipe(
+      ));
+      const validated = yield* runtimePhase(context, "output.validate", () => Schema.validate(operation.output)(output).pipe(
         Effect.mapError(
           (error) => new InvalidOutput({ operation: operation.name, cause: error, output }),
         ),
-      );
+      ));
       yield* context.events.emit("operation.output_validated", { operation: operation.name });
       return validated;
     }).pipe(

@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { spawn } from "node:child_process";
+import { createInterface } from "node:readline";
 import { existsSync, copyFileSync, chmodSync, readFileSync } from "node:fs";
 import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -71,7 +73,7 @@ const withTraceFixture = async (
   }
 };
 
-const finishedMint = async (url: string, turns: readonly ModelResponse["output"][], configuration: { readonly traceDirectory?: string; readonly answerSecret?: boolean } = {}) => {
+const finishedMint = async (url: string, turns: readonly ModelResponse["output"][], configuration: { readonly traceDirectory?: string; readonly answerSecret?: boolean; readonly diagnostics?: { readonly depth: "normal" | "debug" | "trace" | "profile"; readonly capture: "none" | "payload" | "replay" } } = {}) => {
   const requests: ModelRequest[] = [];
   const guardian = recordingGuardian();
   const guardianRequests: ModelRequest[] = [];
@@ -110,6 +112,7 @@ const finishedMint = async (url: string, turns: readonly ModelResponse["output"]
             url,
             intent: "Read the synthetic fixture heading",
             effect: "read",
+            ...(configuration.diagnostics === undefined ? {} : { diagnostics: configuration.diagnostics }),
           },
         }));
         expect(started.isError).not.toBe(true);
@@ -278,5 +281,89 @@ test("trace preserves model requests and MCP output, with secret answers kept pr
     expect(normalized(traced.output)).toBe(normalized(untraced.output));
     const events = await traceEvents(traceDir, traced.jobId);
     expect(events.some((event) => event["kind"] === "guardian.decision.result")).toBe(true);
+  });
+});
+
+
+test("per-job diagnostic depth and capture stay independent in the built MCP", async () => {
+  test.setTimeout(90_000);
+  await withTraceFixture(async ({ traceDir, site }) => {
+    const { jobId } = await finishedMint(site.url, [
+      patch({ [entrypoint]: authoredSource }),
+      [call("execute", execution("example", entrypoint), "selected_failure")],
+    ], { diagnostics: { depth: "profile", capture: "none" } });
+    const text = readFileSync(join(traceDir, `${jobId}.jsonl`), "utf8");
+    for (const privateText of [privateHeading, authoredSource, childCause, childDeepCause]) expect(text).not.toContain(privateText);
+    expect(text).toContain("module.import"); expect(text).toContain("result.send"); expect(text).toContain('"traceCapture":"disabled"');
+    expect(text).not.toContain("Debugger listening");
+  });
+});
+
+test("the operator capture ceiling blocks caller replay escalation", async () => {
+  test.setTimeout(90_000);
+  await withTraceFixture(async ({ traceDir, site }) => {
+    const before = process.env["POMERADO_TRACE_CAPTURE"]; process.env["POMERADO_TRACE_CAPTURE"] = "none";
+    try {
+      const { jobId } = await finishedMint(site.url, [[call("exec_command", { cmd: command }, "capture_ceiling")]], { diagnostics: { depth: "trace", capture: "replay" } });
+      const text = readFileSync(join(traceDir, `${jobId}.jsonl`), "utf8");
+      expect(text).not.toContain(command); expect(text).not.toContain(privateStdout); expect(text).toContain('"traceCapture":"disabled"');
+    } finally { if (before === undefined) delete process.env["POMERADO_TRACE_CAPTURE"]; else process.env["POMERADO_TRACE_CAPTURE"] = before; }
+  });
+});
+
+test("profile diagnostics keep actual stdio stdout limited to JSON-RPC", async () => {
+  test.setTimeout(90_000);
+  await withTraceFixture(async ({ traceDir, site }) => {
+    const turns = [patch({ [entrypoint]: authoredSource }), [call("execute", execution("example", entrypoint), "stdio_profile")]];
+    const child = spawn(process.execPath, ["--input-type=module", "-e", `
+      import {registerHooks} from 'node:module'; import {existsSync} from 'node:fs'; import {fileURLToPath} from 'node:url';
+      registerHooks({resolve:(specifier,context,next)=>{if(context.parentURL?.endsWith('.ts')&&specifier.endsWith('.js')){const source=new URL(specifier.slice(0,-3)+'.ts',context.parentURL);if(existsSync(fileURLToPath(source)))return next(source.href,context);}return next(specifier,context);}});
+      import {startMcpCli} from './dist/typescript/src/standalone/mcp-cli.js';
+      const {scripted,recordingGuardian,quietReviewer,message}=await import('./typescript/tests/browser/guardian-context-fixture.ts');
+      const turns=${JSON.stringify(turns)};
+      startMcpCli(['mint'],{minterProvider:scripted((_request,index)=>turns[index]??[message('Synthetic stopped')]),guardianProvider:recordingGuardian().provider,outcomeReviewerProvider:quietReviewer,timeoutMs:60000});
+    `], { env: { PATH: process.env["PATH"] ?? "", POMERADO_TRACE_DIR: traceDir, POMERADO_TRACE_CAPTURE: "none" }, stdio: ["pipe", "pipe", "pipe"] });
+    const closed = new Promise<void>((resolve) => child.once("close", () => resolve()));
+    let stderr = ""; child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
+    const lines: string[] = []; const invalid: string[] = [];
+    const waiting = new Map<number, (value: unknown) => void>();
+    const reader = createInterface({ input: child.stdout });
+    reader.on("line", (line) => {
+      lines.push(line);
+      try {
+        const parsed = Schema.decodeUnknownSync(Schema.Struct({ jsonrpc: Schema.Literal("2.0"), id: Schema.optional(Schema.Number), result: Schema.optional(Schema.Unknown), error: Schema.optional(Schema.Unknown) }))(JSON.parse(line));
+        if (parsed.id !== undefined) { waiting.get(parsed.id)?.(parsed); waiting.delete(parsed.id); }
+      } catch { invalid.push(line); }
+    });
+    let next = 0;
+    const request = (method: string, params: unknown) => new Promise<unknown>((resolve, reject) => {
+      if (child.exitCode !== null || child.signalCode !== null) { reject(new Error(stderr)); return; }
+      const id = ++next; const exit = () => { clearTimeout(timer); waiting.delete(id); reject(new Error(stderr)); };
+      const timer = setTimeout(() => { child.off("exit", exit); waiting.delete(id); reject(new Error(`Synthetic MCP request timed out. ${stderr}`)); }, 65_000);
+      child.once("exit", exit);
+      waiting.set(id, (value) => { clearTimeout(timer); child.off("exit", exit); resolve(value); });
+      child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+    });
+    try {
+      await request("initialize", { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "synthetic-profile-stdio", version: "1" } });
+      child.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
+      const started = await request("tools/call", { name: "mint", arguments: { name: "synthetic_stdio", url: site.url, intent: "Read synthetic heading", effect: "read", diagnostics: { depth: "profile", capture: "none" } } });
+      const job = objects(started).find((value) => typeof value["job_id"] === "string")?.["job_id"];
+      expect(typeof job).toBe("string");
+      let complete = false;
+      for (let attempt = 0; attempt < 12; attempt++) {
+        const response = await request("tools/call", { name: "get_job", arguments: { job_id: job, wait_seconds: 5 } });
+        const view = objects(response).find((value) => typeof value["status"] === "string");
+        if (view?.["status"] === "completed") { complete = true; break; }
+      }
+      expect(complete, stderr).toBe(true); expect(invalid).toEqual([]); expect(lines.length).toBeGreaterThan(2);
+      const stdout = lines.join("\n"); expect(stdout).not.toContain(privateHeading); expect(stdout).not.toContain(childCause); expect(stdout).not.toContain("Debugger");
+      expect(stderr).not.toContain("Debugger listening");
+      const text = readFileSync(join(traceDir, `${job}.jsonl`), "utf8"); expect(text).toContain("module.import"); expect(text).not.toContain(privateHeading);
+    } finally {
+      child.stdin.end(); child.kill("SIGTERM"); reader.close();
+      const timeout = setTimeout(() => child.kill("SIGKILL"), 5_000);
+      await closed; clearTimeout(timeout);
+    }
   });
 });
